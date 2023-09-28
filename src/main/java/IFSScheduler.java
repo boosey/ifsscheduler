@@ -1,7 +1,6 @@
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
 import io.quarkus.hibernate.reactive.panache.common.WithSession;
 import io.quarkus.logging.Log;
 import io.quarkus.panache.common.Parameters;
@@ -24,24 +23,13 @@ public class IFSScheduler {
 
         boolean dbInitialized = false;
 
-        // @Scheduled(every = "3s")
-        // void runTask2() {
-        // try {
-        // VertxContextSupport.subscribeAndAwait(() -> {
-        // return logFlights();
-        // });
-
-        // } catch (Throwable e) {
-        // e.printStackTrace();
-        // }
-        // }
-
-        @Scheduled(every = "10s")
+        @Scheduled(every = "5s")
         void runTask() {
 
                 if (!dbInitialized) {
                         try {
                                 VertxContextSupport.subscribeAndAwait(() -> {
+                                        dbInitialized = true;
                                         return initializeDB();
                                 });
                         } catch (Throwable e) {
@@ -53,9 +41,11 @@ public class IFSScheduler {
 
                 try {
                         VertxContextSupport.subscribeAndAwait(() -> {
-                                return runProcess();
+                                return runProcess1();
                         });
-
+                        VertxContextSupport.subscribeAndAwait(() -> {
+                                return runProcess2();
+                        });
                 } catch (Throwable e) {
                         e.printStackTrace();
                 }
@@ -63,19 +53,19 @@ public class IFSScheduler {
         }
 
         @WithSession
-        Uni<Boolean> runProcess() {
+        Uni<Boolean> runProcess1() {
 
-                return findNextUnclaimedFlight()
+                Log.info("Checking flights departing in 4 hours\n");
+
+                return findNextUnclaimedFlightDepartingInHours(4)
                                 .onItem()
                                 .<ScheduledFlight>transformToUni(f -> {
-                                        return claimFlight2(f)
+                                        return claimFlight(f)
                                                         .onItem()
                                                         .<ScheduledFlight>transform((b) -> f);
                                 })
                                 .onItem()
                                 .invoke(f -> processFlight(f))
-                                // .invoke(f ->
-                                // Log.info(String.format("\n\n------------------------------------------------\n\n")))
                                 .onItem()
                                 .transform(f -> true)
                                 .onFailure().recoverWithItem(false);
@@ -83,52 +73,52 @@ public class IFSScheduler {
         }
 
         @WithSession
-        Uni<ScheduledFlight> findNextUnclaimedFlight() {
-                LocalDateTime currentDateTime = LocalDateTime.now();
-                LocalDateTime before = currentDateTime.minusMinutes(1);
-                LocalDateTime after = currentDateTime.plusMinutes(0);
+        Uni<Boolean> runProcess2() {
 
-                // System.out.println("Task performed on " + LocalDateTime.now());
-                // Log.info(String.format("\n\n---------------------- %s
-                // ----------------------\n",
-                // LocalDateTime.now().toString()));
+                Log.info("Checking flights departing in 40 minutes\n");
+
+                return findNextUnclaimedFlightDepartingInMinutes(40)
+                                .onItem()
+                                .<ScheduledFlight>transformToUni(f -> {
+                                        return claimFlight(f)
+                                                        .onItem()
+                                                        .<ScheduledFlight>transform((b) -> f);
+                                })
+                                .onItem()
+                                .invoke(f -> processFlight(f))
+                                .onItem()
+                                .transform(f -> true)
+                                .onFailure().recoverWithItem(false);
+
+        }
+
+        @WithSession
+        Uni<ScheduledFlight> findNextUnclaimedFlightDepartingInMinutes(long tMinusDepartureTime) {
+                LocalDateTime currentDateTime = LocalDateTime.now();
+                LocalDateTime before = currentDateTime.plusMinutes(tMinusDepartureTime).minusMinutes(1);
+                LocalDateTime after = currentDateTime.plusMinutes(tMinusDepartureTime);
 
                 return ScheduledFlight
                                 .<ScheduledFlight>find(
                                                 "from ScheduledFlight f where f.claimed = :claimed and f.departureDateTime > :before and f.departureDateTime < :after",
                                                 Parameters.with("claimed", 0).and("before", before).and("after", after))
                                 .firstResult();
-                // .onItem()
-                // .invoke((f) -> Log.info(String.format("\n\nFound flight: %s\tClaimed: %s\n",
-                // f.flight, f.claimed)));
-
         }
 
         @WithSession
-        Uni<List<ScheduledFlight>> logFlights() {
+        Uni<ScheduledFlight> findNextUnclaimedFlightDepartingInHours(long tMinusDepartureTime) {
+                LocalDateTime currentDateTime = LocalDateTime.now();
+                LocalDateTime before = currentDateTime.plusHours(tMinusDepartureTime).minusMinutes(1);
+                LocalDateTime after = currentDateTime.plusHours(tMinusDepartureTime);
 
-                Log.info(String.format("Listing"));
-
-                return ScheduledFlight.<ScheduledFlight>listAll()
-                                .onItem()
-                                .transform(l -> {
-                                        Log.info(String.format("Count: %d", l.size()));
-                                        String logMsg = l.stream()
-                                                        .map((f) -> {
-                                                                var f1 = f;
-                                                                return String.format("Flight: %s\tClaimed: %d",
-                                                                                f.flight, f.claimed);
-                                                        })
-                                                        .reduce("", (logStr, fltStr) -> {
-                                                                var f2 = fltStr;
-                                                                return logStr.concat(fltStr);
-                                                        });
-                                        Log.info(logMsg);
-                                        return l;
-                                });
+                return ScheduledFlight
+                                .<ScheduledFlight>find(
+                                                "from ScheduledFlight f where f.claimed = :claimed and f.departureDateTime > :before and f.departureDateTime < :after",
+                                                Parameters.with("claimed", 0).and("before", before).and("after", after))
+                                .firstResult();
         }
 
-        Uni<RowSet<Row>> claimFlight2(ScheduledFlight flight) {
+        Uni<RowSet<Row>> claimFlight(ScheduledFlight flight) {
 
                 return client.preparedQuery("UPDATE scheduledflight SET claimed = 1 WHERE id = $1")
                                 .execute(Tuple.of(flight.id));
@@ -145,48 +135,48 @@ public class IFSScheduler {
         Uni<Boolean> initializeDB() {
 
                 Log.info("Init DB");
-                dbInitialized = true;
 
                 var c = new ArrayList<ScheduledFlight>();
 
                 Collections.addAll(c,
                                 ScheduledFlight.builder().carrier("DL").flight("1").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().minusMinutes(2)).build(),
+                                                .departureDateTime(LocalDateTime.now().plusHours(4).minusMinutes(2))
+                                                .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("2").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().minusSeconds(30))
+                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).minusSeconds(30))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("3").claimed(0)
-                                                .departureDateTime(LocalDateTime.now())
+                                                .departureDateTime(LocalDateTime.now().plusHours(4))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("4").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(1))
+                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(1))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("5").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(1))
+                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(1))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("6").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(1))
+                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(1))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("7").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(4))
+                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(4))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("8").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(5))
+                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(5))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("9").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(6))
+                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(6))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("10").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(7))
+                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(7))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("11").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(8))
+                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(8))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("12").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(9))
+                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(9))
                                                 .build(),
                                 ScheduledFlight.builder().carrier("DL").flight("13").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(10))
+                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(10))
                                                 .build());
 
                 // Odd code because when adding a collection of records with persist, there is
@@ -199,7 +189,8 @@ public class IFSScheduler {
                                 .onItem()
                                 .<ScheduledFlight>transformToUni(
                                                 (f) -> ScheduledFlight.builder().carrier("DL").flight("14")
-                                                                .departureDateTime(LocalDateTime.now().plusMinutes(10))
+                                                                .departureDateTime(LocalDateTime.now().plusMinutes(40)
+                                                                                .plusMinutes(10))
                                                                 .build().persistAndFlush())
                                 .onItem()
                                 .transform((v) -> true)
