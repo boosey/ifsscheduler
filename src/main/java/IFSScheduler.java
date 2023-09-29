@@ -41,10 +41,10 @@ public class IFSScheduler {
 
                 try {
                         VertxContextSupport.subscribeAndAwait(() -> {
-                                return runProcess1();
+                                return processNextUnclaimedFllight(LocalDateTime.now().plusHours(4));
                         });
                         VertxContextSupport.subscribeAndAwait(() -> {
-                                return runProcess2();
+                                return processNextUnclaimedFllight(LocalDateTime.now().plusMinutes(40));
                         });
                 } catch (Throwable e) {
                         e.printStackTrace();
@@ -53,11 +53,9 @@ public class IFSScheduler {
         }
 
         @WithSession
-        Uni<Boolean> runProcess1() {
+        Uni<Boolean> processNextUnclaimedFllight(LocalDateTime departureTime) {
 
-                Log.info("Checking flights departing in 4 hours\n");
-
-                return findNextUnclaimedFlightDepartingInHours(4)
+                return findNextUnclaimedFlight(departureTime)
                                 .onItem()
                                 .<ScheduledFlight>transformToUni(f -> {
                                         return claimFlight(f)
@@ -73,48 +71,14 @@ public class IFSScheduler {
         }
 
         @WithSession
-        Uni<Boolean> runProcess2() {
-
-                Log.info("Checking flights departing in 40 minutes\n");
-
-                return findNextUnclaimedFlightDepartingInMinutes(40)
-                                .onItem()
-                                .<ScheduledFlight>transformToUni(f -> {
-                                        return claimFlight(f)
-                                                        .onItem()
-                                                        .<ScheduledFlight>transform((b) -> f);
-                                })
-                                .onItem()
-                                .invoke(f -> processFlight(f))
-                                .onItem()
-                                .transform(f -> true)
-                                .onFailure().recoverWithItem(false);
-
-        }
-
-        @WithSession
-        Uni<ScheduledFlight> findNextUnclaimedFlightDepartingInMinutes(long tMinusDepartureTime) {
-                LocalDateTime currentDateTime = LocalDateTime.now();
-                LocalDateTime before = currentDateTime.plusMinutes(tMinusDepartureTime).minusMinutes(1);
-                LocalDateTime after = currentDateTime.plusMinutes(tMinusDepartureTime);
+        Uni<ScheduledFlight> findNextUnclaimedFlight(LocalDateTime departureTime) {
 
                 return ScheduledFlight
                                 .<ScheduledFlight>find(
                                                 "from ScheduledFlight f where f.claimed = :claimed and f.departureDateTime > :before and f.departureDateTime < :after",
-                                                Parameters.with("claimed", 0).and("before", before).and("after", after))
-                                .firstResult();
-        }
-
-        @WithSession
-        Uni<ScheduledFlight> findNextUnclaimedFlightDepartingInHours(long tMinusDepartureTime) {
-                LocalDateTime currentDateTime = LocalDateTime.now();
-                LocalDateTime before = currentDateTime.plusHours(tMinusDepartureTime).minusMinutes(1);
-                LocalDateTime after = currentDateTime.plusHours(tMinusDepartureTime);
-
-                return ScheduledFlight
-                                .<ScheduledFlight>find(
-                                                "from ScheduledFlight f where f.claimed = :claimed and f.departureDateTime > :before and f.departureDateTime < :after",
-                                                Parameters.with("claimed", 0).and("before", before).and("after", after))
+                                                Parameters.with("claimed", 0)
+                                                                .and("before", departureTime.minusMinutes(1))
+                                                                .and("after", departureTime))
                                 .firstResult();
         }
 
