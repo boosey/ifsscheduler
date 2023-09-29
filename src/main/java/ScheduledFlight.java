@@ -15,11 +15,11 @@ import io.quarkus.hibernate.reactive.panache.PanacheEntity;
 @Entity
 public class ScheduledFlight extends PanacheEntity {
 
-    int claimed;
-    String carrier;
-    String flight;
-    LocalDateTime departureDateTime;
-    LocalDateTime arrivalDateTime;
-    String origin;
-    String destination;
+  int claimed;
+  String carrier;
+  String flight;
+  LocalDateTime departureDateTime;
+  LocalDateTime arrivalDateTime;
+  String origin;
+  String destination;
 }

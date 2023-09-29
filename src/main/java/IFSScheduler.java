@@ -1,6 +1,7 @@
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import io.quarkus.hibernate.reactive.panache.common.WithSession;
 import io.quarkus.logging.Log;
 import io.quarkus.panache.common.Parameters;
@@ -10,6 +11,7 @@ import jakarta.transaction.Transactional;
 import jakarta.transaction.Transactional.TxType;
 import io.quarkus.scheduler.Scheduled;
 import io.quarkus.vertx.VertxContextSupport;
+import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.vertx.mutiny.sqlclient.Row;
 import io.vertx.mutiny.sqlclient.RowSet;
@@ -18,149 +20,174 @@ import io.vertx.mutiny.sqlclient.Tuple;
 @ApplicationScoped
 public class IFSScheduler {
 
-        @Inject
-        io.vertx.mutiny.pgclient.PgPool client;
+  @Inject
+  io.vertx.mutiny.pgclient.PgPool client;
 
-        boolean dbInitialized = false;
+  boolean dbInitialized = false;
 
-        @Scheduled(every = "5s")
-        void runTask() {
+  @Scheduled(every = "55s")
+  void runTask() {
+    if (!dbInitialized) {
+      try {
+        VertxContextSupport.subscribeAndAwait(() -> {
+          dbInitialized = true;
+          return initializeDB();
+        });
+      } catch (Throwable e) {
+        e.printStackTrace();
+      }
 
-                if (!dbInitialized) {
-                        try {
-                                VertxContextSupport.subscribeAndAwait(() -> {
-                                        dbInitialized = true;
-                                        return initializeDB();
-                                });
-                        } catch (Throwable e) {
-                                e.printStackTrace();
-                        }
+      Log.info("\n\n\n\n");
+    }
 
-                        Log.info("\n\n\n\n");
-                }
+    try {
+      VertxContextSupport.subscribeAndAwait(() -> {
+        return processUnclaimedFlights(LocalDateTime.now().plusMinutes(40));
+      });
+      VertxContextSupport.subscribeAndAwait(() -> {
+        return processUnclaimedFlights(LocalDateTime.now().plusHours(4));
+      });
 
-                try {
-                        VertxContextSupport.subscribeAndAwait(() -> {
-                                return processNextUnclaimedFllight(LocalDateTime.now().plusHours(4));
-                        });
-                        VertxContextSupport.subscribeAndAwait(() -> {
-                                return processNextUnclaimedFllight(LocalDateTime.now().plusMinutes(40));
-                        });
-                } catch (Throwable e) {
-                        e.printStackTrace();
-                }
+    } catch (Throwable e) {
+      e.printStackTrace();
+    }
 
-        }
+  }
 
-        @WithSession
-        Uni<Boolean> processNextUnclaimedFllight(LocalDateTime departureTime) {
+  @WithSession
+  Uni<Void> processUnclaimedFlights(LocalDateTime departureTime) {
 
-                return findNextUnclaimedFlight(departureTime)
-                                .onItem()
-                                .<ScheduledFlight>transformToUni(f -> {
-                                        return claimFlight(f)
-                                                        .onItem()
-                                                        .<ScheduledFlight>transform((b) -> f);
-                                })
-                                .onItem()
-                                .invoke(f -> processFlight(f))
-                                .onItem()
-                                .transform(f -> true)
-                                .onFailure().recoverWithItem(false);
+    // Get list of all unclaimed flights departing around the departureTime
+    return getUpcomingUnclaimedFlights(departureTime)
+        .onItem()
+        // Change the list to a multi item mutiny stream
+        .transformToMulti(flightList -> Multi.createFrom().items(flightList.stream()))
+        .onItem()
+        // For each flight try to claim it
+        // Multiple container instances of the scheduler could be running
+        // So, another instance could have claimed it
+        // If successful then this instance will process the flight
+        .transformToUni(f -> claimFlight(f)
+            .onItem()
+            .transform(rowSet -> {
+              if (rowSet.rowCount() > 0)
+                return f;
+              else
+                return null;
+            })
 
-        }
+            .onItem()
+            .ifNotNull()
+            .invoke(f1 -> processFlight(f)))
+        .merge()
+        .collect()
+        .asList()
+        .replaceWithVoid();
+  }
 
-        @WithSession
-        Uni<ScheduledFlight> findNextUnclaimedFlight(LocalDateTime departureTime) {
+  @WithSession
+  Uni<List<ScheduledFlight>> getUpcomingUnclaimedFlights(LocalDateTime departureTime) {
 
-                return ScheduledFlight
-                                .<ScheduledFlight>find(
-                                                "from ScheduledFlight f where f.claimed = :claimed and f.departureDateTime > :before and f.departureDateTime < :after",
-                                                Parameters.with("claimed", 0)
-                                                                .and("before", departureTime.minusMinutes(1))
-                                                                .and("after", departureTime))
-                                .firstResult();
-        }
+    return ScheduledFlight
+        .<ScheduledFlight>find(
+            "from ScheduledFlight f where f.claimed = :claimed and f.departureDateTime > :before and f.departureDateTime < :after",
+            Parameters.with("claimed", 0)
+                .and("before", departureTime.minusMinutes(1))
+                .and("after", departureTime))
+        .list();
+  }
 
-        Uni<RowSet<Row>> claimFlight(ScheduledFlight flight) {
+  @WithSession
+  Uni<ScheduledFlight> findNextUnclaimedFlight(LocalDateTime departureTime) {
 
-                return client.preparedQuery("UPDATE scheduledflight SET claimed = 1 WHERE id = $1")
-                                .execute(Tuple.of(flight.id));
-        }
+    return ScheduledFlight
+        .<ScheduledFlight>find(
+            "from ScheduledFlight f where f.claimed = :claimed and f.departureDateTime > :before and f.departureDateTime < :after",
+            Parameters.with("claimed", 0)
+                .and("before", departureTime.minusMinutes(1))
+                .and("after", departureTime))
+        .firstResult();
+  }
 
-        String processFlight(ScheduledFlight f) {
-                Log.info(String.format("\nProcess Flight: %s\tDepart: %s\tProcessed at: %s\n", f.flight,
-                                f.departureDateTime.toString(), LocalDateTime.now().toString()));
-                return f.flight;
-        }
+  Uni<RowSet<Row>> claimFlight(ScheduledFlight flight) {
 
-        @WithSession
-        @Transactional(TxType.REQUIRES_NEW)
-        Uni<Boolean> initializeDB() {
+    return client.preparedQuery("UPDATE scheduledflight SET claimed = 1 WHERE id = $1")
+        .execute(Tuple.of(flight.id));
+  }
 
-                Log.info("Init DB");
+  String processFlight(ScheduledFlight f) {
+    Log.info(String.format("\nProcess Flight: %s\tDepart: %s\tProcessed at: %s\n", f.flight,
+        f.departureDateTime.toString(), LocalDateTime.now().toString()));
+    return f.flight;
+  }
 
-                var c = new ArrayList<ScheduledFlight>();
+  @WithSession
+  @Transactional(TxType.REQUIRES_NEW)
+  Uni<Boolean> initializeDB() {
 
-                Collections.addAll(c,
-                                ScheduledFlight.builder().carrier("DL").flight("1").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusHours(4).minusMinutes(2))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("2").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).minusSeconds(30))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("3").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusHours(4))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("4").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(1))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("5").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(1))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("6").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(1))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("7").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(4))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("8").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(5))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("9").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(6))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("10").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(7))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("11").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(8))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("12").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(9))
-                                                .build(),
-                                ScheduledFlight.builder().carrier("DL").flight("13").claimed(0)
-                                                .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(10))
-                                                .build());
+    Log.info("Init DB");
 
-                // Odd code because when adding a collection of records with persist, there is
-                // no persistAndFlush for a collection. Without flushing, the records never show
-                // up in the database because it is part of the same transaction (or something
-                // else; I use REQUIRED_NEW but it still doesn't flush or commit.) So, I add one
-                // more record so I can persistAndFlush. When that happens the records show up
-                // in the database.
-                return ScheduledFlight.persist(c)
-                                .onItem()
-                                .<ScheduledFlight>transformToUni(
-                                                (f) -> ScheduledFlight.builder().carrier("DL").flight("14")
-                                                                .departureDateTime(LocalDateTime.now().plusMinutes(40)
-                                                                                .plusMinutes(10))
-                                                                .build().persistAndFlush())
-                                .onItem()
-                                .transform((v) -> true)
-                                .onFailure()
-                                .recoverWithItem(v -> false);
+    var c = new ArrayList<ScheduledFlight>();
 
-        }
+    Collections.addAll(c,
+        ScheduledFlight.builder().carrier("DL").flight("1").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusHours(4).minusMinutes(2))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("2").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusMinutes(40).minusSeconds(30))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("3").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusHours(4))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("4").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(1))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("5").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(1))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("6").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(1))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("7").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(4))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("8").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(5))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("9").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(6))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("10").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(7))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("11").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(8))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("12").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusMinutes(40).plusMinutes(9))
+            .build(),
+        ScheduledFlight.builder().carrier("DL").flight("13").claimed(0)
+            .departureDateTime(LocalDateTime.now().plusHours(4).plusMinutes(10))
+            .build());
+
+    // Odd code because when adding a collection of records with persist, there is
+    // no persistAndFlush for a collection. Without flushing, the records never show
+    // up in the database because it is part of the same transaction (or something
+    // else; I use REQUIRED_NEW but it still doesn't flush or commit.) So, I add one
+    // more record so I can persistAndFlush. When that happens the records show up
+    // in the database.
+    return ScheduledFlight.persist(c)
+        .onItem()
+        .<ScheduledFlight>transformToUni(
+            (f) -> ScheduledFlight.builder().carrier("DL").flight("14")
+                .departureDateTime(LocalDateTime.now().plusMinutes(40)
+                    .plusMinutes(10))
+                .build().persistAndFlush())
+        .onItem()
+        .transform((v) -> true)
+        .onFailure()
+        .recoverWithItem(v -> false);
+
+  }
 
 }
